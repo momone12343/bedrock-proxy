@@ -17,8 +17,24 @@ export default async function handler(req, res) {
         body = JSON.parse(body);
       }
 
-      // Iniezione forzata della modalità Thinking
+      // Iniezione forzata della modalità Thinking (Parametri API)
       body.reasoning_effort = "high";
+      body.thinking = {
+        type: "enabled",
+        budget_tokens: 4096
+      };
+
+      // Iniezione della direttiva di ragionamento nel System Prompt
+      const thinkingDirective = "System Directive: You MUST use your internal thinking/reasoning process for EVERY message, regardless of brevity or simplicity. Always analyze step-by-step before answering.";
+
+      if (Array.isArray(body.messages)) {
+        const systemMsg = body.messages.find(m => m.role === 'system');
+        if (systemMsg) {
+          systemMsg.content = `${thinkingDirective}\n\n${systemMsg.content}`;
+        } else {
+          body.messages.unshift({ role: 'system', content: thinkingDirective });
+        }
+      }
 
       // Copia e pulizia degli header
       const headers = {};
