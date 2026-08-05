@@ -36,6 +36,29 @@ export default async function handler(req, res) {
         body: JSON.stringify(body)
       });
 
+      // Se AWS restituisce un errore (status non 200), restituisci il JSON di errore
+      if (!bedrockResponse.ok) {
+        const errorData = await bedrockResponse.json().catch(() => ({ error: 'Errore risposta AWS' }));
+        return res.status(bedrockResponse.status).json(errorData);
+      }
+
+      // GESTIONE STREAMING (se il client richiede stream: true)
+      if (body.stream) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.status(bedrockResponse.status);
+
+        const reader = bedrockResponse.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(value);
+        }
+        return res.end();
+      }
+
+      // GESTIONE RISPOSTA NORMALE (senza streaming)
       const data = await bedrockResponse.json();
       return res.status(bedrockResponse.status).json(data);
 
