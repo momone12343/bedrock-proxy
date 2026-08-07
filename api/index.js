@@ -59,7 +59,7 @@ export const config = {
 
 const BEDROCK_URL = 'https://bedrock-mantle.us-east-1.api.aws/v1/chat/completions';
 const FETCH_TIMEOUT_MS = 55_000; // resta sotto maxDuration per rispondere con un errore leggibile
-const MIN_MAX_TOKENS_WITH_REASONING = 2048;
+const MIN_MAX_TOKENS_WITH_REASONING = 64000;
 
 // Modelli per cui NON ha senso forzare il reasoning (classificatori/guardrail,
 // modelli vision-only...). Pattern testati come substring case-insensitive
@@ -125,8 +125,8 @@ function applyMaxThinking(body) {
       body.reasoning_effort = 'high';
     }
 
-    if (!body.max_tokens || body.max_tokens < MIN_MAX_TOKENS_WITH_REASONING) {
-      body.max_tokens = MIN_MAX_TOKENS_WITH_REASONING;
+    body.max_tokens = MAX_REASONING_TOKENS;
+    body.max_completion_tokens = MAX_REASONING_TOKENS;
     }
 
     maybeInjectSystemDirective(body);
