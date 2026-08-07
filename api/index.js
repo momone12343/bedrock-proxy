@@ -70,6 +70,18 @@
 //     modelli nuovi non ancora mappati, con la stessa logica di
 //     auto-correzione e cache del punto 9.
 //
+// 11) LOG DELLE CHIAMATE: ogni richiesta che arriva viene ora registrata
+//     (modello, URL/regione/prefisso usati, se il reasoning era
+//     compatibile o è stato rifiutato, se la risposta contiene davvero
+//     contenuto di reasoning e una sua anteprima). Consultabile aprendo
+//     l'URL del proxy nel browser con "?log" (tabella) o "?log=json" (dati
+//     grezzi). È un log IN MEMORIA: si azzera quando l'istanza serverless
+//     si riavvia (succede spesso, Vercel non garantisce un'istanza fissa),
+//     quindi va bene per un controllo al volo ma non come storico
+//     permanente. Ogni voce viene anche stampata con console.log, quindi
+//     resta visibile pure nei Runtime Logs di Vercel (dashboard o
+//     `vercel logs`) per la finestra di retention del tuo piano.
+//
 // CONFIGURAZIONE (tutta opzionale, su Vercel > Project > Settings >
 // Environment Variables — se non le imposti il proxy si comporta come la
 // versione base, nessuna rottura):
@@ -81,7 +93,16 @@
 //                        includono l'header "x-proxy-key" con questo
 //                        valore. Protegge dal caso (comune) in cui qualcuno
 //                        trovi l'URL del tuo proxy Vercel e lo usi a tue
-//                        spese sul tuo account AWS.
+//                        spese sul tuo account AWS. Se è impostata, protegge
+//                        anche la pagina di log qui sotto: in browser non
+//                        puoi mandare header custom, quindi lì la stessa
+//                        chiave si passa come "?key=...".
+//
+// COME VEDERE IL LOG:
+//   https://<tuo-progetto>.vercel.app/api/<nome-file>?log        (tabella HTML)
+//   https://<tuo-progetto>.vercel.app/api/<nome-file>?log=json   (dati grezzi)
+//   Aggiungi "&key=LA_TUA_PROXY_ACCESS_KEY" in fondo se hai impostato
+//   PROXY_ACCESS_KEY. La pagina si aggiorna da sola ogni 15 secondi.
 // ============================================================================
 
 const config = {
@@ -223,6 +244,138 @@ function applyMaxThinking(body) {
   return { originalBody: original, wasModified: !skip };
 }
 
+// ============================================================================
+// LOG DELLE CHIAMATE (in-memory) — vedi punto 11 in cima al file
+// ============================================================================
+const MAX_LOG_ENTRIES = 50; // quante richieste tenere in memoria contemporaneamente
+const REASONING_PREVIEW_CHARS = 400; // quanti caratteri di reasoning salvare nell'anteprima
+
+const requestLog = [];
+let logCounter = 0;
+
+function pushLog(entry) {
+  logCounter += 1;
+  const record = { id: logCounter, ts: new Date().toISOString(), ...entry };
+  requestLog.unshift(record);
+  if (requestLog.length > MAX_LOG_ENTRIES) requestLog.length = MAX_LOG_ENTRIES;
+  // Stampato anche nei log "veri" di Vercel: è l'unica copia che sopravvive
+  // al riavvio dell'istanza serverless (il log in-memory invece si azzera).
+  console.log('[bedrock-proxy]', JSON.stringify(record));
+  return record;
+}
+
+// Legge il testo del reasoning da un messaggio di risposta già parsato
+// (risposta non-stream). Il nome campo standard è "reasoning_content"
+// (così lo restituiscono i vari gateway OpenAI-compatibili per i modelli
+// con reasoning su Mantle), ma per sicurezza controlla anche un paio di
+// forme alternative viste in giro — se un modello nuovo usa un campo
+// diverso, aggiungilo qui.
+function getReasoningText(message) {
+  if (!message) return null;
+  if (typeof message.reasoning_content === 'string') return message.reasoning_content;
+  if (typeof message.reasoning === 'string') return message.reasoning;
+  if (message.reasoning && typeof message.reasoning.content === 'string') return message.reasoning.content;
+  return null;
+}
+
+function escapeHtml(str = '') {
+  return String(str).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+function renderLogHtml(entries) {
+  const rows = entries.map((e) => {
+    const compat = e.reasoningSkipped
+      ? '<span class="tag tag-grey">non richiesto</span>'
+      : e.reasoningAccepted
+        ? '<span class="tag tag-green">compatibile</span>'
+        : '<span class="tag tag-red">rifiutato</span>';
+    const reasoning = e.reasoningDetected
+      ? '<span class="tag tag-green">sì</span>'
+      : '<span class="tag tag-grey">no</span>';
+    const status = e.ok === false
+      ? `<span class="tag tag-red">${escapeHtml(e.httpStatus ?? 'errore')}</span>`
+      : `<span class="tag tag-green">${escapeHtml(e.httpStatus ?? 'ok')}</span>`;
+    const preview = e.reasoningPreview
+      ? `<details><summary>anteprima ragionamento</summary><pre>${escapeHtml(e.reasoningPreview)}</pre></details>`
+      : '';
+    const note = [
+      e.routeAutoCorrected ? 'route auto-corretta' : '',
+      e.usedFallbackWithoutReasoning ? 'retry senza reasoning' : '',
+      e.usedOverride ? 'override reasoning' : '',
+      e.error ? `errore: ${escapeHtml(e.error)}` : '',
+    ].filter(Boolean).join(' · ');
+    return `<tr>
+      <td>${escapeHtml(new Date(e.ts).toLocaleTimeString('it-IT'))}</td>
+      <td>${escapeHtml(e.model)}</td>
+      <td>${compat}</td>
+      <td>${reasoning}${preview}</td>
+      <td>${status}</td>
+      <td class="url">${escapeHtml(e.url || '')}</td>
+      <td class="note">${note}</td>
+    </tr>`;
+  }).join('\n');
+
+  return `<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Log proxy Bedrock</title>
+<meta http-equiv="refresh" content="15">
+<style>
+  body { background:#111; color:#eee; font-family:-apple-system,Segoe UI,Roboto,sans-serif; margin:0; padding:16px; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  p.sub { color:#999; font-size:13px; margin:0 0 16px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid #333; vertical-align:top; }
+  th { color:#999; font-weight:600; }
+  .tag { display:inline-block; padding:2px 8px; border-radius:10px; font-size:12px; white-space:nowrap; }
+  .tag-green { background:#1e4620; color:#7ee787; }
+  .tag-red { background:#4a1e1e; color:#ff8080; }
+  .tag-grey { background:#333; color:#aaa; }
+  .url { font-family:monospace; font-size:11px; color:#999; word-break:break-all; }
+  .note { font-size:11px; color:#e0a030; }
+  pre { white-space:pre-wrap; font-size:11px; color:#ccc; background:#1a1a1a; padding:8px; border-radius:6px; max-width:60ch; }
+  details summary { cursor:pointer; color:#7aa2f7; font-size:12px; margin-top:4px; }
+</style>
+</head>
+<body>
+<h1>Log chiamate proxy Bedrock</h1>
+<p class="sub">${entries.length} richiest${entries.length === 1 ? 'a' : 'e'} in memoria su questa istanza · si aggiorna da sola ogni 15s · <a href="?log=json" style="color:#7aa2f7">vedi JSON</a></p>
+<table>
+<tr><th>Ora</th><th>Modello</th><th>Reasoning</th><th>Sta ragionando?</th><th>Stato</th><th>URL</th><th>Note</th></tr>
+${rows || '<tr><td colspan="7">Nessuna richiesta ancora registrata su questa istanza.</td></tr>'}
+</table>
+</body>
+</html>`;
+}
+
+// GET (o qualsiasi metodo diverso da POST/OPTIONS): senza "?log" risponde
+// come prima ("Proxy Vercel Attivo!"), così non cambia nulla per eventuali
+// health-check. Con "?log" mostra la tabella, con "?log=json" i dati grezzi.
+function handleStatusOrLog(req, res) {
+  const query = req.query || {};
+  if (!('log' in query)) {
+    return res.status(200).send('Proxy Vercel Attivo!');
+  }
+
+  if (process.env.PROXY_ACCESS_KEY) {
+    const provided = req.headers['x-proxy-key'] || query.key;
+    if (provided !== process.env.PROXY_ACCESS_KEY) {
+      return res.status(401).json({ error: "Non autorizzato: aggiungi &key=LA_TUA_PROXY_ACCESS_KEY all'URL." });
+    }
+  }
+
+  if (query.log === 'json') {
+    return res.status(200).json({ count: requestLog.length, entries: requestLog });
+  }
+
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  return res.status(200).send(renderLogHtml(requestLog));
+}
+
 async function fetchBedrock(body, headers, url, timeoutMs) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -245,11 +398,20 @@ async function fetchBedrock(body, headers, url, timeoutMs) {
 // for this account") e da quel momento ricorda la combinazione corretta:
 // niente più doppie chiamate dopo la prima volta che un modello "nuovo"
 // viene usato.
+// Restituisce { response, url, region, prefix, corrected } invece della
+// sola response: url/region/prefix/corrected servono solo per il log delle
+// chiamate (vedi punto 11 in cima al file), il comportamento di routing è
+// invariato rispetto a prima.
 async function callBedrockSmart(body, headers, timeoutMs) {
   const model = body.model || '';
   const route = resolveRoute(model);
+  const url = bedrockUrl(route.region, route.prefix);
 
-  let response = await fetchBedrock(body, headers, bedrockUrl(route.region, route.prefix), timeoutMs);
+  let response = await fetchBedrock(body, headers, url, timeoutMs);
+  let finalUrl = url;
+  let finalRegion = route.region;
+  let finalPrefix = route.prefix;
+  let corrected = false;
 
   if (!response.ok) {
     const errorText = await response.clone().text().catch(() => '');
@@ -262,15 +424,20 @@ async function callBedrockSmart(body, headers, timeoutMs) {
     }
 
     if (candidate) {
-      const retryResponse = await fetchBedrock(body, headers, bedrockUrl(candidate.region, candidate.prefix), timeoutMs);
+      const retryUrl = bedrockUrl(candidate.region, candidate.prefix);
+      const retryResponse = await fetchBedrock(body, headers, retryUrl, timeoutMs);
       if (retryResponse.ok) {
         routeCache.set(model, candidate); // confermato: da ora usa subito questa combinazione per il modello
       }
       response = retryResponse;
+      finalUrl = retryUrl;
+      finalRegion = candidate.region;
+      finalPrefix = candidate.prefix;
+      corrected = true;
     }
   }
 
-  return response;
+  return { response, url: finalUrl, region: finalRegion, prefix: finalPrefix, corrected };
 }
 
 async function handler(req, res) {
@@ -285,7 +452,9 @@ async function handler(req, res) {
   }
 
   if (req.method !== 'POST') {
-    return res.status(200).send('Proxy Vercel Attivo!');
+    // GET senza "?log": stato del proxy, come prima. Con "?log" / "?log=json":
+    // la pagina di log delle ultime chiamate (vedi punto 11 in cima al file).
+    return handleStatusOrLog(req, res);
   }
 
   // --- Protezione opzionale anti-abuso: si attiva SOLO se imposti
@@ -296,6 +465,11 @@ async function handler(req, res) {
       return res.status(401).json({ error: 'Non autorizzato: header x-proxy-key mancante o errato.' });
     }
   }
+
+  // Accumula le informazioni per la voce di log di questa richiesta; viene
+  // scritta con pushLog() su ogni percorso di uscita (successo, errore,
+  // eccezione) cosi' compare sempre, non solo quando tutto va bene.
+  let logEntry = null;
 
   try {
     let body = req.body;
@@ -308,8 +482,18 @@ async function handler(req, res) {
       return res.status(400).json({ error: 'Body mancante o non valido.' });
     }
 
+    const model = body.model || '(modello non specificato)';
+
     // Iniezione dinamica del thinking/reasoning, con copia di sicurezza per il retry
     const { originalBody, wasModified } = applyMaxThinking(body);
+
+    logEntry = {
+      model,
+      stream: Boolean(body.stream),
+      reasoningSkipped: !wasModified,
+      usedOverride: Boolean(findOverride(model)),
+      usedFallbackWithoutReasoning: false,
+    };
 
     // Copia e pulizia degli header
     const headers = {};
@@ -327,20 +511,34 @@ async function handler(req, res) {
 
     // --- Chiamata a Bedrock: sceglie da sola il path /openai/ o normale,
     // con timeout per non restare appesi fino al limite hard di Vercel ---
-    let bedrockResponse = await callBedrockSmart(body, headers, FETCH_TIMEOUT_MS);
+    let attempt = await callBedrockSmart(body, headers, FETCH_TIMEOUT_MS);
 
     // --- Retry dinamico: se il modello ha rifiutato i parametri di
     // reasoning appena aggiunti, ritenta UNA volta senza, invece di
     // bloccare la chat. Questo è il pezzo che ti protegge quando cambi
     // modello o quando ne esce uno nuovo con un formato diverso. ---
-    if (!bedrockResponse.ok && wasModified) {
-      bedrockResponse = await callBedrockSmart(originalBody, headers, FETCH_TIMEOUT_MS);
+    if (!attempt.response.ok && wasModified) {
+      attempt = await callBedrockSmart(originalBody, headers, FETCH_TIMEOUT_MS);
+      logEntry.usedFallbackWithoutReasoning = true;
     }
 
+    logEntry.url = attempt.url;
+    logEntry.region = attempt.region;
+    logEntry.openAIPrefix = attempt.prefix;
+    logEntry.routeAutoCorrected = attempt.corrected;
+    logEntry.httpStatus = attempt.response.status;
+    logEntry.ok = attempt.response.ok;
+    // "Compatibile con il reasoning" nella pratica = i parametri erano nella
+    // richiesta mandata E Bedrock l'ha accettata (nessun retry, nessun errore).
+    logEntry.reasoningAccepted = wasModified && !logEntry.usedFallbackWithoutReasoning && attempt.response.ok;
+
     // Se AWS restituisce ancora un errore, restituisci il JSON di errore
-    if (!bedrockResponse.ok) {
-      const errorData = await bedrockResponse.json().catch(() => ({ error: 'Errore risposta AWS' }));
-      return res.status(bedrockResponse.status).json(errorData);
+    if (!attempt.response.ok) {
+      const errorData = await attempt.response.json().catch(() => ({ error: 'Errore risposta AWS' }));
+      logEntry.error = (errorData && (errorData.error?.message || errorData.error)) || 'Errore sconosciuto';
+      logEntry.reasoningDetected = false;
+      pushLog(logEntry);
+      return res.status(attempt.response.status).json(errorData);
     }
 
     // GESTIONE STREAMING (se il client richiede stream: true)
@@ -348,30 +546,75 @@ async function handler(req, res) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
-      res.status(bedrockResponse.status);
+      res.status(attempt.response.status);
 
-      const reader = bedrockResponse.body.getReader();
+      const reader = attempt.response.body.getReader();
+
+      // Rilevazione "sta ragionando" in streaming: senza fare il parse
+      // completo di ogni evento SSE (costoso e fragile su frammenti a
+      // metà), cerca la comparsa del campo "reasoning_content" nel testo
+      // grezzo dei chunk e ne accumula un'anteprima, senza toccare i byte
+      // che vengono comunque inoltrati al client invariati.
+      const decoder = new TextDecoder();
+      const reasoningRe = /"reasoning_content"\s*:\s*"((?:\\.|[^"\\])*)"/g;
+      let reasoningDetected = false;
+      let reasoningPreview = '';
+      let logged = false;
+
+      const finalizeLog = (note) => {
+        if (logged) return;
+        logged = true;
+        logEntry.reasoningDetected = reasoningDetected;
+        if (reasoningPreview) logEntry.reasoningPreview = reasoningPreview;
+        if (note) logEntry.note = note;
+        pushLog(logEntry);
+      };
 
       // Se Janitor chiude la connessione (utente cambia chat, riprova, ecc.),
       // interrompi anche la lettura da Bedrock invece di continuare a
       // generare (e pagare) token che nessuno riceverà.
       req.on('close', () => {
         reader.cancel().catch(() => {});
+        finalizeLog('connessione chiusa dal client durante lo stream');
       });
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         res.write(value);
+
+        if (reasoningPreview.length < REASONING_PREVIEW_CHARS) {
+          const chunkText = decoder.decode(value, { stream: true });
+          reasoningRe.lastIndex = 0;
+          let m;
+          while ((m = reasoningRe.exec(chunkText)) && reasoningPreview.length < REASONING_PREVIEW_CHARS) {
+            reasoningDetected = true;
+            try {
+              reasoningPreview += JSON.parse(`"${m[1]}"`); // decodifica gli escape JSON (\n, \", ecc.)
+            } catch {
+              reasoningPreview += m[1];
+            }
+          }
+        }
       }
+      finalizeLog();
       return res.end();
     }
 
     // GESTIONE RISPOSTA NORMALE (senza streaming)
-    const data = await bedrockResponse.json();
-    return res.status(bedrockResponse.status).json(data);
+    const data = await attempt.response.json();
+    const reasoningText = getReasoningText(data?.choices?.[0]?.message);
+    logEntry.reasoningDetected = Boolean(reasoningText && reasoningText.trim());
+    if (reasoningText) logEntry.reasoningPreview = reasoningText.slice(0, REASONING_PREVIEW_CHARS);
+    pushLog(logEntry);
+    return res.status(attempt.response.status).json(data);
 
   } catch (err) {
+    if (logEntry) {
+      logEntry.error = err.message;
+      logEntry.exception = true;
+      pushLog(logEntry);
+    }
     if (err.name === 'AbortError') {
       return res.status(504).json({ error: 'Timeout nella richiesta a Bedrock.' });
     }
