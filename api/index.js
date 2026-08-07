@@ -124,7 +124,7 @@ const MIN_MAX_TOKENS_WITH_REASONING = 100_000; // tetto alto "di margine": il mo
 const OPENAI_PREFIX_MODELS = new Set([
   'xai.grok-4.3',
   'openai.gpt-5.5',
-  'openai.gpt-5.4',
+  'openai.gpt-5.6-sol',
   'google.gemma-4-31b',
   'google.gemma-4-e2b',
   'google.gemma-4-26b-a4b',
