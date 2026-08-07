@@ -39,6 +39,20 @@
 //    server, protezione opzionale anti-abuso, chiusura pulita dello stream
 //    se il client si disconnette.
 //
+// 7) FIX 500 in produzione: il file usava sintassi ESM (`export` /
+//    `export default`) ma Vercel/Node lo caricava come CommonJS
+//    ("SyntaxError: Unexpected token 'export'") perché manca "type":
+//    "module" nel package.json più vicino. Convertito tutto a CommonJS
+//    (module.exports): funziona subito, senza toccare altri file.
+//
+// 8) reasoning_effort è già al massimo dello schema Bedrock Mantle ("high"
+//    — i valori validi sono solo none/low/medium/high, "illimitato" non
+//    esiste). Alzati invece i due limiti pratici che possono tagliare
+//    corto un ragionamento lungo: maxDuration/timeout (60s -> 300s, il
+//    tetto del piano Hobby; dimmi se sei su Pro/Enterprise e si può salire
+//    a 800s o 1800s) e la soglia minima di max_tokens riservata quando il
+//    reasoning è attivo (2048 -> 4096).
+//
 // CONFIGURAZIONE (tutta opzionale, su Vercel > Project > Settings >
 // Environment Variables — se non le imposti il proxy si comporta come la
 // versione base, nessuna rottura):
@@ -53,13 +67,16 @@
 //                        spese sul tuo account AWS.
 // ============================================================================
 
-export const config = {
-  maxDuration: 60, // alza a 300 se sei su piano Pro/Fluid Compute e ti serve di più
+const config = {
+  // 300s = default E massimo sul piano Hobby (con Fluid Compute, attivo di
+  // default sui progetti nuovi). Su Pro/Enterprise si può salire fino a
+  // 800s senza altro, o fino a 1800s (beta) con configurazione aggiuntiva.
+  maxDuration: 300,
 };
 
 const BEDROCK_URL = 'https://bedrock-mantle.us-east-1.api.aws/v1/chat/completions';
-const FETCH_TIMEOUT_MS = 55_000; // resta sotto maxDuration per rispondere con un errore leggibile
-const MIN_MAX_TOKENS_WITH_REASONING = 64000;
+const FETCH_TIMEOUT_MS = 280_000; // resta sotto i 300s di maxDuration, per rispondere con un errore leggibile invece di un hard-kill
+const MIN_MAX_TOKENS_WITH_REASONING = 4096; // alzato da 2048: più margine tra ragionamento "high" e risposta visibile
 
 // Modelli per cui NON ha senso forzare il reasoning (classificatori/guardrail,
 // modelli vision-only...). Pattern testati come substring case-insensitive
@@ -125,8 +142,8 @@ function applyMaxThinking(body) {
       body.reasoning_effort = 'high';
     }
 
-    body.max_tokens = MAX_REASONING_TOKENS;
-    body.max_completion_tokens = MAX_REASONING_TOKENS;
+    if (!body.max_tokens || body.max_tokens < MIN_MAX_TOKENS_WITH_REASONING) {
+      body.max_tokens = MIN_MAX_TOKENS_WITH_REASONING;
     }
 
     maybeInjectSystemDirective(body);
@@ -144,7 +161,7 @@ async function callBedrock(body, headers, signal) {
   });
 }
 
-export default async function handler(req, res) {
+async function handler(req, res) {
   // --- CORS (per Janitor / SillyTavern / Lorebally) ---
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -262,3 +279,6 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: err.message });
   }
 }
+
+module.exports = handler;
+module.exports.config = config;
