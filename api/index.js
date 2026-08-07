@@ -51,7 +51,24 @@
 //    corto un ragionamento lungo: maxDuration/timeout (60s -> 300s, il
 //    tetto del piano Hobby; dimmi se sei su Pro/Enterprise e si può salire
 //    a 800s o 1800s) e la soglia minima di max_tokens riservata quando il
-//    reasoning è attivo (2048 -> 4096).
+//    reasoning è attivo (2048 -> 100.000, su richiesta: è un tetto di
+//    margine, il modello non è obbligato a usarlo tutto).
+//
+// 9) URL Mantle dinamico: alcuni modelli (xai.grok-4.3 e altri, vedi
+//    OPENAI_PREFIX_MODELS) vogliono il path "/openai/v1/..." invece del
+//    normale "/v1/...", e non è deducibile dal nome del modello. Il proxy
+//    sceglie da solo il path giusto per la lista nota; se un modello nuovo
+//    (non ancora in lista) viene chiamato sul path sbagliato, si
+//    auto-corregge al primo tentativo e se lo ricorda per le richieste
+//    successive — nessuna modifica manuale.
+//
+// 10) Errore reale visto in produzione con xai.grok-4.3: "isn't supported
+//     on this route". Causa diversa dal prefisso: questo modello (per ora)
+//     è disponibile SOLO sulla regione us-west-2, non sulla regione di
+//     default us-east-1. Aggiunta una mappa di hint regione per modello
+//     (MODEL_REGION_HINTS) più un fallback automatico su us-west-2 per
+//     modelli nuovi non ancora mappati, con la stessa logica di
+//     auto-correzione e cache del punto 9.
 //
 // CONFIGURAZIONE (tutta opzionale, su Vercel > Project > Settings >
 // Environment Variables — se non le imposti il proxy si comporta come la
@@ -74,9 +91,63 @@ const config = {
   maxDuration: 300,
 };
 
-const BEDROCK_URL = 'https://bedrock-mantle.us-east-1.api.aws/v1/chat/completions';
+const DEFAULT_REGION = 'us-east-1'; // dove girano i tuoi modelli "principali" (gpt-oss, GLM, Kimi, MiniMax...)
+const FALLBACK_REGION = 'us-west-2'; // seconda regione nota per Mantle: tentativo automatico se un modello nuovo non è raggiungibile sulla default
 const FETCH_TIMEOUT_MS = 280_000; // resta sotto i 300s di maxDuration, per rispondere con un errore leggibile invece di un hard-kill
-const MIN_MAX_TOKENS_WITH_REASONING = 4096; // alzato da 2048: più margine tra ragionamento "high" e risposta visibile
+const MIN_MAX_TOKENS_WITH_REASONING = 100_000; // tetto alto "di margine": il modello lo usa solo se ne ha bisogno, non è un target
+
+// Alcuni modelli su Mantle vogliono il path "/openai/v1/..." invece del
+// normale "/v1/...": non è deducibile dal nome/vendor del modello (es. non
+// è "tutti gli openai.*", gpt-oss NON lo richiede), AWS lo documenta caso
+// per caso nella model card.
+const OPENAI_PREFIX_MODELS = new Set([
+  'xai.grok-4.3',
+  'openai.gpt-5.5',
+  'openai.gpt-5.4',
+  'google.gemma-4-31b',
+  'google.gemma-4-e2b',
+  'google.gemma-4-26b-a4b',
+]);
+
+// Alcuni modelli sono disponibili SOLO in regioni specifiche (rollout
+// progressivo AWS, non tutte le regioni hanno tutti i modelli). Chiamarli
+// sulla regione sbagliata dà "model ... isn't supported on this route"
+// anche col prefisso /openai/ corretto — è un errore diverso da quello del
+// prefisso, gestito separatamente qui sotto.
+const MODEL_REGION_HINTS = {
+  'xai.grok-4.3': 'us-west-2', // unica regione supportata al momento
+  'openai.gpt-5.5': 'us-east-2',
+  'openai.gpt-5.4': 'us-east-2',
+};
+
+// Ricorda, per la durata dell'istanza Lambda "calda", la combinazione
+// regione+prefisso confermata per un dato modello (hint sopra + scoperte
+// per tentativi) — così un modello nuovo che AWS aggiunge domani si
+// auto-corregge dopo il primo tentativo, senza editare il file.
+const routeCache = new Map();
+
+function resolveRoute(model) {
+  if (routeCache.has(model)) return routeCache.get(model);
+  return {
+    region: MODEL_REGION_HINTS[model] || DEFAULT_REGION,
+    prefix: OPENAI_PREFIX_MODELS.has(model),
+  };
+}
+
+function bedrockUrl(region, useOpenAIPrefix) {
+  const base = `https://bedrock-mantle.${region}.api.aws`;
+  return useOpenAIPrefix ? `${base}/openai/v1/chat/completions` : `${base}/v1/chat/completions`;
+}
+
+// Due segnali di routing distinti restituiti da AWS: uno per "modello non
+// disponibile in questa regione", uno per "manca il prefisso /openai/".
+// Nessuno dei due è un rifiuto sui parametri della richiesta.
+function isRegionRoutingError(errorText = '') {
+  return /isn'?t supported on this route/i.test(errorText);
+}
+function isPrefixRoutingError(errorText = '') {
+  return /is not enabled for this account/i.test(errorText);
+}
 
 // Modelli per cui NON ha senso forzare il reasoning (classificatori/guardrail,
 // modelli vision-only...). Pattern testati come substring case-insensitive
@@ -152,13 +223,54 @@ function applyMaxThinking(body) {
   return { originalBody: original, wasModified: !skip };
 }
 
-async function callBedrock(body, headers, signal) {
-  return fetch(BEDROCK_URL, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-    signal,
-  });
+async function fetchBedrock(body, headers, url, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// Sceglie regione+path giusti per il modello richiesto (hint noti + cache)
+// e chiama Bedrock. Se la risposta segnala routing sbagliato, ritenta UNA
+// volta con la correzione mirata a QUEL segnale (regione diversa se
+// "isn't supported on this route", prefisso diverso se "is not enabled
+// for this account") e da quel momento ricorda la combinazione corretta:
+// niente più doppie chiamate dopo la prima volta che un modello "nuovo"
+// viene usato.
+async function callBedrockSmart(body, headers, timeoutMs) {
+  const model = body.model || '';
+  const route = resolveRoute(model);
+
+  let response = await fetchBedrock(body, headers, bedrockUrl(route.region, route.prefix), timeoutMs);
+
+  if (!response.ok) {
+    const errorText = await response.clone().text().catch(() => '');
+    let candidate = null;
+
+    if (isRegionRoutingError(errorText) && route.region !== FALLBACK_REGION) {
+      candidate = { region: FALLBACK_REGION, prefix: route.prefix };
+    } else if (isPrefixRoutingError(errorText)) {
+      candidate = { region: route.region, prefix: !route.prefix };
+    }
+
+    if (candidate) {
+      const retryResponse = await fetchBedrock(body, headers, bedrockUrl(candidate.region, candidate.prefix), timeoutMs);
+      if (retryResponse.ok) {
+        routeCache.set(model, candidate); // confermato: da ora usa subito questa combinazione per il modello
+      }
+      response = retryResponse;
+    }
+  }
+
+  return response;
 }
 
 async function handler(req, res) {
@@ -213,29 +325,16 @@ async function handler(req, res) {
       headers['authorization'] = `Bearer ${process.env.BEDROCK_API_KEY}`;
     }
 
-    // --- Chiamata a Bedrock con timeout, per non restare appesi fino al
-    // limite hard di Vercel senza un errore leggibile ---
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    let bedrockResponse;
-    try {
-      bedrockResponse = await callBedrock(body, headers, controller.signal);
-    } finally {
-      clearTimeout(timeout);
-    }
+    // --- Chiamata a Bedrock: sceglie da sola il path /openai/ o normale,
+    // con timeout per non restare appesi fino al limite hard di Vercel ---
+    let bedrockResponse = await callBedrockSmart(body, headers, FETCH_TIMEOUT_MS);
 
     // --- Retry dinamico: se il modello ha rifiutato i parametri di
     // reasoning appena aggiunti, ritenta UNA volta senza, invece di
     // bloccare la chat. Questo è il pezzo che ti protegge quando cambi
     // modello o quando ne esce uno nuovo con un formato diverso. ---
     if (!bedrockResponse.ok && wasModified) {
-      const controller2 = new AbortController();
-      const timeout2 = setTimeout(() => controller2.abort(), FETCH_TIMEOUT_MS);
-      try {
-        bedrockResponse = await callBedrock(originalBody, headers, controller2.signal);
-      } finally {
-        clearTimeout(timeout2);
-      }
+      bedrockResponse = await callBedrockSmart(originalBody, headers, FETCH_TIMEOUT_MS);
     }
 
     // Se AWS restituisce ancora un errore, restituisci il JSON di errore
@@ -282,4 +381,4 @@ async function handler(req, res) {
 
 module.exports = handler;
 module.exports.config = config;
-    
+  
