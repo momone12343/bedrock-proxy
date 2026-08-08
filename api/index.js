@@ -82,6 +82,38 @@
 //     resta visibile pure nei Runtime Logs di Vercel (dashboard o
 //     `vercel logs`) per la finestra di retention del tuo piano.
 //
+// 12) Errore reale con openai.gpt-5.6-sol: "does not support the
+//     '/v1/chat/completions' API". Causa diversa dai punti 9/10: qui NON
+//     è un problema di prefisso o di regione. Tutta la famiglia OpenAI
+//     "frontier" da GPT-5.4 in su (gpt-5.4, gpt-5.5, gpt-5.6-sol/terra/
+//     luna) su Bedrock Mantle non parla affatto Chat Completions, solo la
+//     Responses API (path /openai/v1/responses, formato diverso:
+//     "messages" diventa "input", "reasoning_effort" diventa un oggetto
+//     {reasoning:{effort:...}}, la risposta usa "output" invece di
+//     "choices"). gpt-5.4 e gpt-5.5 erano già in OPENAI_PREFIX_MODELS ma
+//     quella era la correzione sbagliata: il prefisso da solo non basta,
+//     serve tradurre il protocollo. Rimossi da lì, spostati in
+//     RESPONSES_API_MODELS.
+//
+//     Aggiunta una traduzione completa Chat Completions <-> Responses API
+//     (toResponsesRequestBody / toChatCompletionsResponse /
+//     createChatCompletionsSSEStream): il resto del proxy — e Janitor/
+//     SillyTavern dall'altra parte — continuano a vedere solo Chat
+//     Completions, la conversione avviene solo per questi modelli
+//     specifici, in entrambe le direzioni e anche in streaming. Come per
+//     prefisso/regione, se un modello NUOVO non ancora in lista
+//     restituisce lo stesso errore, il proxy prova da solo la Responses
+//     API e se funziona se lo ricorda per le chiamate successive.
+//
+//     ATTENZIONE: a differenza del resto del file (verificato in
+//     produzione), questa parte non è ancora stata testata contro
+//     l'endpoint reale — non ho un modo per farlo da qui. La forma degli
+//     eventi di streaming della Responses API è meno documentata di
+//     quella Chat Completions, quindi è il pezzo più probabile da dover
+//     aggiustare se vedi ancora errori proprio su gpt-5.6-sol dopo il
+//     deploy. Il log (?log) mostra region/url/modalità usati per ogni
+//     chiamata: è il primo posto da guardare per capire cosa succede.
+//
 // CONFIGURAZIONE (tutta opzionale, su Vercel > Project > Settings >
 // Environment Variables — se non le imposti il proxy si comporta come la
 // versione base, nessuna rottura):
@@ -118,17 +150,41 @@ const FETCH_TIMEOUT_MS = 280_000; // resta sotto i 300s di maxDuration, per risp
 const MIN_MAX_TOKENS_WITH_REASONING = 100_000; // tetto alto "di margine": il modello lo usa solo se ne ha bisogno, non è un target
 
 // Alcuni modelli su Mantle vogliono il path "/openai/v1/..." invece del
-// normale "/v1/...": non è deducibile dal nome/vendor del modello (es. non
-// è "tutti gli openai.*", gpt-oss NON lo richiede), AWS lo documenta caso
-// per caso nella model card.
+// normale "/v1/...", ma restano sulla Chat Completions API: non è
+// deducibile dal nome/vendor del modello (es. non è "tutti gli openai.*",
+// gpt-oss NON lo richiede), AWS lo documenta caso per caso nella model
+// card. ATTENZIONE: questo è diverso dai modelli in RESPONSES_API_MODELS
+// qui sotto, che non parlano Chat Completions affatto (vedi punto 12).
 const OPENAI_PREFIX_MODELS = new Set([
   'xai.grok-4.3',
-  'openai.gpt-5.5',
-  'openai.gpt-5.6-sol',
   'google.gemma-4-31b',
   'google.gemma-4-e2b',
   'google.gemma-4-26b-a4b',
 ]);
+
+// Famiglia OpenAI "frontier" (GPT-5.4 in su) su Bedrock Mantle: NON parla
+// Chat Completions in nessuna forma, solo la Responses API
+// (/openai/v1/responses, formato richiesta/risposta diverso — vedi punto
+// 12 e le funzioni toResponsesRequestBody/toChatCompletionsResponse più
+// sotto). GPT-OSS (gpt-oss-120b/20b) invece sta bene su Chat Completions
+// standard e NON va messo qui.
+const RESPONSES_API_MODELS = new Set([
+  'openai.gpt-5.4',
+  'openai.gpt-5.5',
+  'openai.gpt-5.6-sol',
+  'openai.gpt-5.6-terra',
+  'openai.gpt-5.6-luna',
+]);
+
+// Modelli nuovi (non ancora nella lista sopra) scoperti "sul campo" perché
+// hanno risposto con lo stesso errore "does not support .../chat/completions
+// API": si azzera come routeCache al riavvio dell'istanza, ma nel frattempo
+// evita un tentativo a vuoto per le chiamate successive allo stesso modello.
+const responsesModeCache = new Set();
+
+function usesResponsesApi(model) {
+  return RESPONSES_API_MODELS.has(model) || responsesModeCache.has(model);
+}
 
 // Alcuni modelli sono disponibili SOLO in regioni specifiche (rollout
 // progressivo AWS, non tutte le regioni hanno tutti i modelli). Chiamarli
@@ -160,14 +216,26 @@ function bedrockUrl(region, useOpenAIPrefix) {
   return useOpenAIPrefix ? `${base}/openai/v1/chat/completions` : `${base}/v1/chat/completions`;
 }
 
-// Due segnali di routing distinti restituiti da AWS: uno per "modello non
-// disponibile in questa regione", uno per "manca il prefisso /openai/".
-// Nessuno dei due è un rifiuto sui parametri della richiesta.
+// URL della Responses API (sempre col prefisso /openai/, non c'è una
+// variante senza — vedi punto 12).
+function bedrockResponsesUrl(region) {
+  return `https://bedrock-mantle.${region}.api.aws/openai/v1/responses`;
+}
+
+// Tre segnali di routing/protocollo distinti restituiti da AWS: uno per
+// "modello non disponibile in questa regione", uno per "manca il prefisso
+// /openai/", uno per "questo modello non parla affatto Chat Completions,
+// solo Responses API" (vedi punto 12). Nessuno dei tre è un rifiuto sui
+// parametri della richiesta (quello lo gestisce già il retry-senza-
+// reasoning più sotto nell'handler).
 function isRegionRoutingError(errorText = '') {
   return /isn'?t supported on this route/i.test(errorText);
 }
 function isPrefixRoutingError(errorText = '') {
   return /is not enabled for this account/i.test(errorText);
+}
+function isResponsesOnlyError(errorText = '') {
+  return /does(?:n't| not)\s*support the ['"][^'"]*\/chat\/completions['"]?\s*API/i.test(errorText);
 }
 
 // Modelli per cui NON ha senso forzare il reasoning (classificatori/guardrail,
@@ -301,6 +369,7 @@ function renderLogHtml(entries) {
       ? `<details><summary>anteprima ragionamento</summary><pre>${escapeHtml(e.reasoningPreview)}</pre></details>`
       : '';
     const note = [
+      e.responsesMode ? 'via Responses API' : '',
       e.routeAutoCorrected ? 'route auto-corretta' : '',
       e.usedFallbackWithoutReasoning ? 'retry senza reasoning' : '',
       e.usedOverride ? 'override reasoning' : '',
@@ -391,53 +460,247 @@ async function fetchBedrock(body, headers, url, timeoutMs) {
   }
 }
 
-// Sceglie regione+path giusti per il modello richiesto (hint noti + cache)
-// e chiama Bedrock. Se la risposta segnala routing sbagliato, ritenta UNA
-// volta con la correzione mirata a QUEL segnale (regione diversa se
-// "isn't supported on this route", prefisso diverso se "is not enabled
-// for this account") e da quel momento ricorda la combinazione corretta:
-// niente più doppie chiamate dopo la prima volta che un modello "nuovo"
-// viene usato.
-// Restituisce { response, url, region, prefix, corrected } invece della
-// sola response: url/region/prefix/corrected servono solo per il log delle
-// chiamate (vedi punto 11 in cima al file), il comportamento di routing è
-// invariato rispetto a prima.
+// ============================================================================
+// TRADUZIONE Chat Completions <-> Responses API — vedi punto 12 in cima al
+// file. Isolata qui apposta: il resto del proxy (retry, logging, streaming
+// verso Janitor/SillyTavern) continua a lavorare solo in "linguaggio" Chat
+// Completions, senza sapere che sotto, per questi modelli, sta succedendo
+// altro.
+// ============================================================================
+
+// body Chat Completions (messages, reasoning_effort, max_tokens, ...) ->
+// body Responses API (input, reasoning.effort, max_output_tokens, ...).
+function toResponsesRequestBody(chatBody) {
+  const responsesBody = {
+    model: chatBody.model,
+    input: (chatBody.messages || []).map((m) => ({ role: m.role, content: m.content })),
+  };
+
+  if (chatBody.stream) responsesBody.stream = true;
+  if (chatBody.reasoning_effort) responsesBody.reasoning = { effort: chatBody.reasoning_effort };
+  if (typeof chatBody.max_tokens === 'number') responsesBody.max_output_tokens = chatBody.max_tokens;
+  if (typeof chatBody.temperature === 'number') responsesBody.temperature = chatBody.temperature;
+  if (typeof chatBody.top_p === 'number') responsesBody.top_p = chatBody.top_p;
+
+  return responsesBody;
+}
+
+// risposta Responses API (già parsata) -> oggetto che assomiglia a una
+// risposta Chat Completions, cosi' il resto del proxy (e Janitor/
+// SillyTavern) non deve sapere che sotto e' cambiata API.
+function toChatCompletionsResponse(responsesJson, model) {
+  const items = Array.isArray(responsesJson.output) ? responsesJson.output : [];
+  let text = '';
+  let reasoningText = '';
+
+  for (const item of items) {
+    if (item.type === 'message' && Array.isArray(item.content)) {
+      for (const part of item.content) {
+        if (typeof part.text === 'string') text += part.text;
+      }
+    } else if (typeof item.type === 'string' && item.type.includes('reasoning')) {
+      // Il "summary" del reasoning (non il chain-of-thought grezzo, che di
+      // norma non viene esposto) puo' comparire in forme diverse.
+      if (typeof item.text === 'string') reasoningText += item.text;
+      else if (Array.isArray(item.summary)) {
+        reasoningText += item.summary.map((s) => (typeof s === 'string' ? s : s.text || '')).join('');
+      }
+    }
+  }
+  if (!text && typeof responsesJson.output_text === 'string') text = responsesJson.output_text;
+
+  const message = { role: 'assistant', content: text };
+  if (reasoningText) message.reasoning_content = reasoningText;
+
+  return {
+    id: responsesJson.id || `chatcmpl-${Date.now()}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{
+      index: 0,
+      message,
+      finish_reason: responsesJson.status === 'completed' ? 'stop' : (responsesJson.status || 'stop'),
+    }],
+    usage: responsesJson.usage,
+  };
+}
+
+// Legge lo stream SSE della Responses API e lo ritraduce "al volo" (senza
+// bufferizzare tutta la risposta) in uno stream SSE in stile Chat
+// Completions: stessa forma (data: {"choices":[{"delta":{...}}]}) che il
+// resto del proxy, Janitor/SillyTavern e il log di questo file già sanno
+// leggere. I nomi esatti degli eventi Responses (response.output_text.delta,
+// response.completed, ...) sono controllati con un match "contiene", non
+// esatto, per tollerare piccole variazioni senza rompersi del tutto.
+function createChatCompletionsSSEStream(upstreamBody, model) {
+  const upstreamReader = upstreamBody.getReader();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  const chatId = `chatcmpl-${Date.now()}`;
+  let buffer = '';
+
+  function chunk(delta, finishReason = null, usage) {
+    const payload = {
+      id: chatId,
+      object: 'chat.completion.chunk',
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [{ index: 0, delta, finish_reason: finishReason }],
+    };
+    if (usage) payload.usage = usage;
+    return encoder.encode(`data: ${JSON.stringify(payload)}\n\n`);
+  }
+
+  return new ReadableStream({
+    async pull(controller) {
+      let done, value;
+      try {
+        ({ done, value } = await upstreamReader.read());
+      } catch (err) {
+        controller.error(err);
+        return;
+      }
+
+      if (done) {
+        controller.enqueue(chunk({}, 'stop'));
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        controller.close();
+        return;
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop(); // ultima riga forse incompleta: rimessa in coda per il prossimo pull
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const raw = trimmed.slice(5).trim();
+        if (!raw || raw === '[DONE]') continue;
+
+        let event;
+        try {
+          event = JSON.parse(raw);
+        } catch {
+          continue; // frammento non ancora completo o riga non-JSON: ignorata
+        }
+
+        const type = event.type || '';
+        if (type.includes('output_text.delta') && typeof event.delta === 'string') {
+          controller.enqueue(chunk({ content: event.delta }));
+        } else if (type.includes('reasoning') && typeof event.delta === 'string') {
+          controller.enqueue(chunk({ reasoning_content: event.delta }));
+        } else if (type.includes('completed')) {
+          const usage = event.response && event.response.usage;
+          controller.enqueue(chunk({}, 'stop', usage));
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+          return;
+        } else if (type.includes('failed') || type === 'error') {
+          controller.error(new Error(event.message || 'Errore dalla Responses API'));
+          return;
+        }
+        // altri tipi di evento (response.created, response.output_item.added,
+        // ...) non hanno un equivalente utile in Chat Completions: ignorati.
+      }
+    },
+    cancel(reason) {
+      upstreamReader.cancel(reason).catch(() => {});
+    },
+  });
+}
+
+// Fa la chiamata reale sulla Responses API (traducendo il body in
+// ingresso) e restituisce un Response "travestito" da Chat Completions:
+// stesso .ok/.status/.json()/.body di sempre, cosi' chi lo chiama
+// (callBedrockSmart, poi l'handler) non deve saperne la differenza. In
+// caso di errore la risposta passa cosi' com'e' (non tradotta): l'handler
+// la inoltra comunque al client come JSON di errore.
+async function fetchBedrockResponses(chatBody, headers, region, timeoutMs) {
+  const responsesBody = toResponsesRequestBody(chatBody);
+  const url = bedrockResponsesUrl(region);
+  const upstream = await fetchBedrock(responsesBody, headers, url, timeoutMs);
+
+  if (!upstream.ok) return upstream;
+
+  if (chatBody.stream) {
+    const stream = createChatCompletionsSSEStream(upstream.body, chatBody.model);
+    return new Response(stream, { status: upstream.status, headers: { 'content-type': 'text/event-stream' } });
+  }
+
+  const responsesJson = await upstream.json();
+  const ccJson = toChatCompletionsResponse(responsesJson, chatBody.model);
+  return new Response(JSON.stringify(ccJson), { status: upstream.status, headers: { 'content-type': 'application/json' } });
+}
+
+// Punto unico di chiamata usato da callBedrockSmart: sceglie se passare da
+// Chat Completions (comportamento di sempre) o dalla traduzione Responses
+// API sopra, a seconda di responsesMode.
+async function fetchBedrockAny(chatBody, headers, route, responsesMode, timeoutMs) {
+  if (responsesMode) {
+    return fetchBedrockResponses(chatBody, headers, route.region, timeoutMs);
+  }
+  const url = bedrockUrl(route.region, route.prefix);
+  return fetchBedrock(chatBody, headers, url, timeoutMs);
+}
+
+// Sceglie regione+path+protocollo giusti per il modello richiesto (hint
+// noti + cache) e chiama Bedrock. Se la risposta segnala routing/
+// protocollo sbagliato, ritenta UNA volta con la correzione mirata a QUEL
+// segnale (regione diversa se "isn't supported on this route", prefisso
+// diverso se "is not enabled for this account", Responses API se "does
+// not support .../chat/completions API" — vedi punto 12) e da quel
+// momento ricorda la combinazione corretta: niente più doppie chiamate
+// dopo la prima volta che un modello "nuovo" viene usato.
+// Restituisce { response, url, region, prefix, responsesMode, corrected }
+// invece della sola response: i campi extra servono solo per il log delle
+// chiamate (vedi punto 11 in cima al file).
 async function callBedrockSmart(body, headers, timeoutMs) {
   const model = body.model || '';
-  const route = resolveRoute(model);
-  const url = bedrockUrl(route.region, route.prefix);
-
-  let response = await fetchBedrock(body, headers, url, timeoutMs);
-  let finalUrl = url;
-  let finalRegion = route.region;
-  let finalPrefix = route.prefix;
+  let finalRoute = resolveRoute(model);
+  let responsesMode = usesResponsesApi(model);
   let corrected = false;
+
+  let response = await fetchBedrockAny(body, headers, finalRoute, responsesMode, timeoutMs);
 
   if (!response.ok) {
     const errorText = await response.clone().text().catch(() => '');
-    let candidate = null;
 
-    if (isRegionRoutingError(errorText) && route.region !== FALLBACK_REGION) {
-      candidate = { region: FALLBACK_REGION, prefix: route.prefix };
-    } else if (isPrefixRoutingError(errorText)) {
-      candidate = { region: route.region, prefix: !route.prefix };
-    }
-
-    if (candidate) {
-      const retryUrl = bedrockUrl(candidate.region, candidate.prefix);
-      const retryResponse = await fetchBedrock(body, headers, retryUrl, timeoutMs);
+    if (!responsesMode && isResponsesOnlyError(errorText)) {
+      const retryResponse = await fetchBedrockAny(body, headers, finalRoute, true, timeoutMs);
       if (retryResponse.ok) {
-        routeCache.set(model, candidate); // confermato: da ora usa subito questa combinazione per il modello
+        responsesModeCache.add(model); // confermato: da ora questo modello parte subito in modalità Responses
       }
       response = retryResponse;
-      finalUrl = retryUrl;
-      finalRegion = candidate.region;
-      finalPrefix = candidate.prefix;
+      responsesMode = true;
+      corrected = true;
+    } else if (isRegionRoutingError(errorText) && finalRoute.region !== FALLBACK_REGION) {
+      const candidate = { region: FALLBACK_REGION, prefix: finalRoute.prefix };
+      const retryResponse = await fetchBedrockAny(body, headers, candidate, responsesMode, timeoutMs);
+      if (retryResponse.ok) {
+        routeCache.set(model, candidate);
+      }
+      response = retryResponse;
+      finalRoute = candidate;
+      corrected = true;
+    } else if (!responsesMode && isPrefixRoutingError(errorText)) {
+      const candidate = { region: finalRoute.region, prefix: !finalRoute.prefix };
+      const retryResponse = await fetchBedrockAny(body, headers, candidate, false, timeoutMs);
+      if (retryResponse.ok) {
+        routeCache.set(model, candidate);
+      }
+      response = retryResponse;
+      finalRoute = candidate;
       corrected = true;
     }
   }
 
-  return { response, url: finalUrl, region: finalRegion, prefix: finalPrefix, corrected };
+  const url = responsesMode
+    ? bedrockResponsesUrl(finalRoute.region)
+    : bedrockUrl(finalRoute.region, finalRoute.prefix);
+
+  return { response, url, region: finalRoute.region, prefix: finalRoute.prefix, responsesMode, corrected };
 }
 
 async function handler(req, res) {
@@ -525,6 +788,7 @@ async function handler(req, res) {
     logEntry.url = attempt.url;
     logEntry.region = attempt.region;
     logEntry.openAIPrefix = attempt.prefix;
+    logEntry.responsesMode = attempt.responsesMode;
     logEntry.routeAutoCorrected = attempt.corrected;
     logEntry.httpStatus = attempt.response.status;
     logEntry.ok = attempt.response.ok;
