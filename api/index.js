@@ -114,6 +114,16 @@
 //     deploy. Il log (?log) mostra region/url/modalità usati per ogni
 //     chiamata: è il primo posto da guardare per capire cosa succede.
 //
+// 13) Stesso problema del punto 12, scoperto su google.gemma-4-31b: errore
+//     "'max_tokens' is not supported with this model" con Chat
+//     Completions. La documentazione AWS per Gemma 4 conferma che su
+//     Mantle il reasoning si abilita "tramite il parametro reasoning
+//     della Responses API" — stesso principio di GPT-5.4+, sintomo
+//     diverso (qui non rifiuta l'endpoint, rifiuta il parametro). Spostati
+//     tutti e tre i Gemma 4 (E2B, 31B, 26B-A4B) da OPENAI_PREFIX_MODELS a
+//     RESPONSES_API_MODELS: usano la stessa traduzione già scritta per
+//     GPT-5.6, nessun codice nuovo.
+//
 // CONFIGURAZIONE (tutta opzionale, su Vercel > Project > Settings >
 // Environment Variables — se non le imposti il proxy si comporta come la
 // versione base, nessuna rottura):
@@ -151,29 +161,33 @@ const MIN_MAX_TOKENS_WITH_REASONING = 100_000; // tetto alto "di margine": il mo
 
 // Alcuni modelli su Mantle vogliono il path "/openai/v1/..." invece del
 // normale "/v1/...", ma restano sulla Chat Completions API: non è
-// deducibile dal nome/vendor del modello (es. non è "tutti gli openai.*",
-// gpt-oss NON lo richiede), AWS lo documenta caso per caso nella model
-// card. ATTENZIONE: questo è diverso dai modelli in RESPONSES_API_MODELS
-// qui sotto, che non parlano Chat Completions affatto (vedi punto 12).
+// deducibile dal nome/vendor del modello, AWS lo documenta caso per caso
+// nella model card. ATTENZIONE: questo è diverso dai modelli in
+// RESPONSES_API_MODELS qui sotto, che non parlano Chat Completions affatto
+// (vedi punti 12 e 13).
 const OPENAI_PREFIX_MODELS = new Set([
   'xai.grok-4.3',
-  'google.gemma-4-31b',
-  'google.gemma-4-e2b',
-  'google.gemma-4-26b-a4b',
 ]);
 
-// Famiglia OpenAI "frontier" (GPT-5.4 in su) su Bedrock Mantle: NON parla
-// Chat Completions in nessuna forma, solo la Responses API
-// (/openai/v1/responses, formato richiesta/risposta diverso — vedi punto
-// 12 e le funzioni toResponsesRequestBody/toChatCompletionsResponse più
-// sotto). GPT-OSS (gpt-oss-120b/20b) invece sta bene su Chat Completions
-// standard e NON va messo qui.
+// Famiglia OpenAI "frontier" (GPT-5.4 in su) e famiglia Gemma 4 (E2B, 31B,
+// 26B-A4B) su Bedrock Mantle: NON parlano Chat Completions in modo
+// completo, solo la Responses API (/openai/v1/responses, formato diverso
+// — vedi punto 12 e 13, e le funzioni toResponsesRequestBody/
+// toChatCompletionsResponse più sotto). Per Gemma 4 il sintomo è diverso
+// da GPT-5.6 (non rifiuta l'endpoint, rifiuta il parametro max_tokens),
+// ma la causa e la correzione sono le stesse: la documentazione AWS
+// conferma che su Mantle il reasoning per Gemma 4 si abilita solo tramite
+// la Responses API. GPT-OSS (gpt-oss-120b/20b) invece sta bene su Chat
+// Completions standard e NON va messo qui.
 const RESPONSES_API_MODELS = new Set([
   'openai.gpt-5.4',
   'openai.gpt-5.5',
   'openai.gpt-5.6-sol',
   'openai.gpt-5.6-terra',
   'openai.gpt-5.6-luna',
+  'google.gemma-4-31b',
+  'google.gemma-4-e2b',
+  'google.gemma-4-26b-a4b',
 ]);
 
 // Modelli nuovi (non ancora nella lista sopra) scoperti "sul campo" perché
@@ -315,20 +329,81 @@ function applyMaxThinking(body) {
 // ============================================================================
 // LOG DELLE CHIAMATE (in-memory) — vedi punto 11 in cima al file
 // ============================================================================
-const MAX_LOG_ENTRIES = 50; // quante richieste tenere in memoria contemporaneamente
+const MAX_LOG_ENTRIES = 50; // quante richieste tenere (in memoria, e nel database persistente se collegato)
 const REASONING_PREVIEW_CHARS = 400; // quanti caratteri di reasoning salvare nell'anteprima
 
 const requestLog = [];
 let logCounter = 0;
 
-function pushLog(entry) {
+// ----------------------------------------------------------------------
+// Persistenza opzionale del log su Upstash Redis (via Vercel Marketplace:
+// Storage -> Marketplace -> Upstash, poi ridispiega). Se colleghi un
+// database, Vercel/Upstash aggiungono da soli le variabili d'ambiente con
+// le credenziali — controlliamo due nomi possibili perché a seconda
+// dell'integrazione usata Vercel imposta l'uno o l'altro:
+// UPSTASH_REDIS_REST_URL/TOKEN (nome nativo Upstash) oppure
+// KV_REST_API_URL/TOKEN (nome storico di Vercel KV, alcune integrazioni
+// lo usano ancora). Se NESSUNA delle due è impostata, il proxy si
+// comporta esattamente come prima: solo log in memoria, nessun errore.
+// ----------------------------------------------------------------------
+const REDIS_LOG_KEY = 'bedrock-proxy:log';
+
+function redisCredentials() {
+  return {
+    url: process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL,
+    token: process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN,
+  };
+}
+
+// Esegue più comandi Redis in una sola chiamata HTTP (endpoint "pipeline"
+// di Upstash), per non aggiungere due round-trip di rete a ogni
+// richiesta. Non lancia mai: se Redis non è configurato, non risponde, o
+// le credenziali sono sbagliate, restituisce null e chi chiama ricade sul
+// solo log in memoria — il proxy continua a funzionare comunque.
+async function redisPipeline(commands) {
+  const { url, token } = redisCredentials();
+  if (!url || !token) return null;
+  try {
+    const res = await fetch(`${url}/pipeline`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(commands),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+async function persistLogEntry(record) {
+  await redisPipeline([
+    ['LPUSH', REDIS_LOG_KEY, JSON.stringify(record)],
+    ['LTRIM', REDIS_LOG_KEY, '0', String(MAX_LOG_ENTRIES - 1)],
+  ]);
+}
+
+// Restituisce l'array delle voci persistite su Redis, oppure null se Redis
+// non è configurato/raggiungibile (cosi' chi chiama sa di dover ricadere
+// sul log in memoria, invece di credere per errore che il log sia vuoto).
+async function readPersistedLog() {
+  const result = await redisPipeline([['LRANGE', REDIS_LOG_KEY, '0', String(MAX_LOG_ENTRIES - 1)]]);
+  const raw = result && result[0] && result[0].result;
+  if (!Array.isArray(raw)) return null;
+  return raw.map((s) => { try { return JSON.parse(s); } catch { return null; } }).filter(Boolean);
+}
+
+async function pushLog(entry) {
   logCounter += 1;
   const record = { id: logCounter, ts: new Date().toISOString(), ...entry };
   requestLog.unshift(record);
   if (requestLog.length > MAX_LOG_ENTRIES) requestLog.length = MAX_LOG_ENTRIES;
-  // Stampato anche nei log "veri" di Vercel: è l'unica copia che sopravvive
-  // al riavvio dell'istanza serverless (il log in-memory invece si azzera).
+  // Stampato anche nei log "veri" di Vercel (utili come backup a brevissimo
+  // termine: 1 ora sul piano Hobby). La vera persistenza, se collegata,
+  // è quella su Redis qui sotto — l'unica che sopravvive al riavvio
+  // dell'istanza serverless.
   console.log('[bedrock-proxy]', JSON.stringify(record));
+  await persistLogEntry(record); // no-op silenzioso se Redis non è configurato
   return record;
 }
 
@@ -352,7 +427,7 @@ function escapeHtml(str = '') {
   }[c]));
 }
 
-function renderLogHtml(entries) {
+function renderLogHtml(entries, persistent) {
   const rows = entries.map((e) => {
     const compat = e.reasoningSkipped
       ? '<span class="tag tag-grey">non richiesto</span>'
@@ -412,10 +487,10 @@ function renderLogHtml(entries) {
 </head>
 <body>
 <h1>Log chiamate proxy Bedrock</h1>
-<p class="sub">${entries.length} richiest${entries.length === 1 ? 'a' : 'e'} in memoria su questa istanza · si aggiorna da sola ogni 15s · <a href="?log=json" style="color:#7aa2f7">vedi JSON</a></p>
+<p class="sub">${entries.length} richiest${entries.length === 1 ? 'a' : 'e'} · ${persistent ? '<span class="tag tag-green">storico persistente (Redis)</span>' : '<span class="tag tag-grey">solo memoria di questa istanza</span>'} · si aggiorna da sola ogni 15s · <a href="?log=json" style="color:#7aa2f7">vedi JSON</a></p>
 <table>
 <tr><th>Ora</th><th>Modello</th><th>Reasoning</th><th>Sta ragionando?</th><th>Stato</th><th>URL</th><th>Note</th></tr>
-${rows || '<tr><td colspan="7">Nessuna richiesta ancora registrata su questa istanza.</td></tr>'}
+${rows || '<tr><td colspan="7">Nessuna richiesta ancora registrata.</td></tr>'}
 </table>
 </body>
 </html>`;
@@ -424,7 +499,9 @@ ${rows || '<tr><td colspan="7">Nessuna richiesta ancora registrata su questa ist
 // GET (o qualsiasi metodo diverso da POST/OPTIONS): senza "?log" risponde
 // come prima ("Proxy Vercel Attivo!"), così non cambia nulla per eventuali
 // health-check. Con "?log" mostra la tabella, con "?log=json" i dati grezzi.
-function handleStatusOrLog(req, res) {
+// Se è collegato Redis, legge lo storico persistente da lì; altrimenti
+// ricade sul log in memoria di questa istanza (comportamento di prima).
+async function handleStatusOrLog(req, res) {
   const query = req.query || {};
   if (!('log' in query)) {
     return res.status(200).send('Proxy Vercel Attivo!');
@@ -437,12 +514,16 @@ function handleStatusOrLog(req, res) {
     }
   }
 
+  const persisted = await readPersistedLog();
+  const entries = persisted || requestLog;
+  const usingPersistent = Boolean(persisted);
+
   if (query.log === 'json') {
-    return res.status(200).json({ count: requestLog.length, entries: requestLog });
+    return res.status(200).json({ count: entries.length, persistent: usingPersistent, entries });
   }
 
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  return res.status(200).send(renderLogHtml(requestLog));
+  return res.status(200).send(renderLogHtml(entries, usingPersistent));
 }
 
 async function fetchBedrock(body, headers, url, timeoutMs) {
@@ -801,8 +882,9 @@ async function handler(req, res) {
       const errorData = await attempt.response.json().catch(() => ({ error: 'Errore risposta AWS' }));
       logEntry.error = (errorData && (errorData.error?.message || errorData.error)) || 'Errore sconosciuto';
       logEntry.reasoningDetected = false;
-      pushLog(logEntry);
-      return res.status(attempt.response.status).json(errorData);
+      res.status(attempt.response.status).json(errorData); // risposta al client subito
+      await pushLog(logEntry); // poi salva il log (anche su Redis se collegato), senza far aspettare il client
+      return;
     }
 
     // GESTIONE STREAMING (se il client richiede stream: true)
@@ -824,14 +906,16 @@ async function handler(req, res) {
       let reasoningDetected = false;
       let reasoningPreview = '';
       let logged = false;
+      let finalizeLogPromise = Promise.resolve();
 
       const finalizeLog = (note) => {
-        if (logged) return;
+        if (logged) return finalizeLogPromise;
         logged = true;
         logEntry.reasoningDetected = reasoningDetected;
         if (reasoningPreview) logEntry.reasoningPreview = reasoningPreview;
         if (note) logEntry.note = note;
-        pushLog(logEntry);
+        finalizeLogPromise = pushLog(logEntry);
+        return finalizeLogPromise;
       };
 
       // Se Janitor chiude la connessione (utente cambia chat, riprova, ecc.),
@@ -839,7 +923,7 @@ async function handler(req, res) {
       // generare (e pagare) token che nessuno riceverà.
       req.on('close', () => {
         reader.cancel().catch(() => {});
-        finalizeLog('connessione chiusa dal client durante lo stream');
+        finalizeLog('connessione chiusa dal client durante lo stream').catch(() => {});
       });
 
       while (true) {
@@ -861,8 +945,9 @@ async function handler(req, res) {
           }
         }
       }
-      finalizeLog();
-      return res.end();
+      res.end(); // segnale di fine stream al client, subito
+      await finalizeLog(); // poi salva il log (anche su Redis se collegato)
+      return;
     }
 
     // GESTIONE RISPOSTA NORMALE (senza streaming)
@@ -870,19 +955,22 @@ async function handler(req, res) {
     const reasoningText = getReasoningText(data?.choices?.[0]?.message);
     logEntry.reasoningDetected = Boolean(reasoningText && reasoningText.trim());
     if (reasoningText) logEntry.reasoningPreview = reasoningText.slice(0, REASONING_PREVIEW_CHARS);
-    pushLog(logEntry);
-    return res.status(attempt.response.status).json(data);
+    res.status(attempt.response.status).json(data); // risposta al client subito
+    await pushLog(logEntry); // poi salva il log (anche su Redis se collegato)
+    return;
 
   } catch (err) {
+    if (err.name === 'AbortError') {
+      res.status(504).json({ error: 'Timeout nella richiesta a Bedrock.' });
+    } else {
+      res.status(500).json({ error: err.message });
+    }
     if (logEntry) {
       logEntry.error = err.message;
       logEntry.exception = true;
-      pushLog(logEntry);
+      await pushLog(logEntry);
     }
-    if (err.name === 'AbortError') {
-      return res.status(504).json({ error: 'Timeout nella richiesta a Bedrock.' });
-    }
-    return res.status(500).json({ error: err.message });
+    return;
   }
 }
 
