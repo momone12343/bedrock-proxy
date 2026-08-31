@@ -124,6 +124,35 @@
 //     RESPONSES_API_MODELS: usano la stessa traduzione già scritta per
 //     GPT-5.6, nessun codice nuovo.
 //
+// 14) DIAGNOSTICA REASONING: su google.gemma-4-31b il reasoning risultava
+//     sempre "no" nel log anche con reasoning_effort al massimo e messaggi
+//     tutt'altro che banali (contesto Janitor pieno di personaggio/mondo).
+//     Non potendo verificare contro l'endpoint reale la forma esatta con
+//     cui Gemma restituisce il reasoning sulla Responses API, invece di
+//     tirare a indovinare una seconda volta ho aggiunto una diagnostica
+//     leggera: quando reasoningDetected risulta false, il log include
+//     anche debugInfo — SOLO i nomi dei tipi di item/evento e i nomi dei
+//     campi (mai il contenuto delle chat, resta privato) — sia per le
+//     risposte normali (describeItems) sia per lo streaming
+//     (seenEventTypes dentro createChatCompletionsSSEStream). Visibile in
+//     "?log=json". Se ricompare "no" con reasoning_effort alto su un
+//     messaggio complesso, guarda debugInfo: dirà se il modello manda il
+//     reasoning con un nome di campo diverso da quello che riconosciamo,
+//     cosa che a quel punto si sistema con certezza invece che a tentativi.
+//
+// 15) Stesso problema del punto 10, scoperto su xai.grok-4.6: la console
+//     AWS lo mostra disponibile solo su Oregon, e infatti il model card
+//     ufficiale conferma "https://bedrock-mantle.us-west-2.api.aws/openai/v1"
+//     — stessa combinazione di grok-4.3 (prefisso /openai/ + regione
+//     us-west-2), non solo la regione. Il motivo per cui l'auto-correzione
+//     da sola non bastava: corregge UNA dimensione alla volta (prima
+//     regione, poi prefisso), quindi se servono entrambe insieme il
+//     secondo tentativo fallisce comunque sul prefisso mancante. Aggiunto
+//     alle liste note (MODEL_REGION_HINTS + OPENAI_PREFIX_MODELS) così
+//     parte corretto al primo tentativo, come grok-4.3. Resta su Chat
+//     Completions normale (confermato che funziona), non serve la
+//     traduzione Responses API dei punti 12-13.
+//
 // CONFIGURAZIONE (tutta opzionale, su Vercel > Project > Settings >
 // Environment Variables — se non le imposti il proxy si comporta come la
 // versione base, nessuna rottura):
@@ -167,6 +196,7 @@ const MIN_MAX_TOKENS_WITH_REASONING = 100_000; // tetto alto "di margine": il mo
 // (vedi punti 12 e 13).
 const OPENAI_PREFIX_MODELS = new Set([
   'xai.grok-4.3',
+  'xai.grok-4.6',
 ]);
 
 // Famiglia OpenAI "frontier" (GPT-5.4 in su) e famiglia Gemma 4 (E2B, 31B,
@@ -207,6 +237,7 @@ function usesResponsesApi(model) {
 // prefisso, gestito separatamente qui sotto.
 const MODEL_REGION_HINTS = {
   'xai.grok-4.3': 'us-west-2', // unica regione supportata al momento
+  'xai.grok-4.6': 'us-west-2', // confermato dal model card AWS: stessa combinazione di grok-4.3
   'openai.gpt-5.5': 'us-east-2',
   'openai.gpt-5.4': 'us-east-2',
 };
@@ -448,6 +479,7 @@ function renderLogHtml(entries, persistent) {
       e.routeAutoCorrected ? 'route auto-corretta' : '',
       e.usedFallbackWithoutReasoning ? 'retry senza reasoning' : '',
       e.usedOverride ? 'override reasoning' : '',
+      e.debugInfo ? 'diagnostica in ?log=json' : '',
       e.error ? `errore: ${escapeHtml(e.error)}` : '',
     ].filter(Boolean).join(' · ');
     return `<tr>
@@ -569,6 +601,19 @@ function toResponsesRequestBody(chatBody) {
 // risposta Responses API (già parsata) -> oggetto che assomiglia a una
 // risposta Chat Completions, cosi' il resto del proxy (e Janitor/
 // SillyTavern) non deve sapere che sotto e' cambiata API.
+// Oltre al testo, restituisce anche una "forma" diagnostica degli item
+// grezzi (solo type + nomi dei campi, MAI il contenuto: niente testo di
+// chat nei log) — serve solo per capire, quando reasoningText risulta
+// vuoto, come il modello struttura davvero la sua risposta su questo
+// endpoint, invece di continuare a indovinare.
+function describeItems(items) {
+  if (!Array.isArray(items)) return null;
+  return items.map((item) => ({
+    type: item && item.type,
+    keys: item && typeof item === 'object' ? Object.keys(item) : [],
+  }));
+}
+
 function toChatCompletionsResponse(responsesJson, model) {
   const items = Array.isArray(responsesJson.output) ? responsesJson.output : [];
   let text = '';
@@ -593,7 +638,7 @@ function toChatCompletionsResponse(responsesJson, model) {
   const message = { role: 'assistant', content: text };
   if (reasoningText) message.reasoning_content = reasoningText;
 
-  return {
+  const ccJson = {
     id: responsesJson.id || `chatcmpl-${Date.now()}`,
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
@@ -605,6 +650,8 @@ function toChatCompletionsResponse(responsesJson, model) {
     }],
     usage: responsesJson.usage,
   };
+
+  return { ccJson, outputShape: reasoningText ? null : describeItems(items) };
 }
 
 // Legge lo stream SSE della Responses API e lo ritraduce "al volo" (senza
@@ -614,12 +661,23 @@ function toChatCompletionsResponse(responsesJson, model) {
 // leggere. I nomi esatti degli eventi Responses (response.output_text.delta,
 // response.completed, ...) sono controllati con un match "contiene", non
 // esatto, per tollerare piccole variazioni senza rompersi del tutto.
-function createChatCompletionsSSEStream(upstreamBody, model) {
+function createChatCompletionsSSEStream(upstreamBody, model, onDiagnostics) {
   const upstreamReader = upstreamBody.getReader();
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   const chatId = `chatcmpl-${Date.now()}`;
   let buffer = '';
+  // Solo i NOMI dei tipi di evento visti (mai il contenuto/testo): serve a
+  // capire, se "reasoning_content" non compare mai, se il modello manda
+  // eventi di reasoning con un nome diverso da quello che riconosciamo.
+  const seenEventTypes = new Set();
+  let reasoningSeen = false;
+  let diagnosticsSent = false;
+  const sendDiagnostics = () => {
+    if (diagnosticsSent || !onDiagnostics) return;
+    diagnosticsSent = true;
+    onDiagnostics({ seenEventTypes: [...seenEventTypes], reasoningSeen });
+  };
 
   function chunk(delta, finishReason = null, usage) {
     const payload = {
@@ -634,59 +692,86 @@ function createChatCompletionsSSEStream(upstreamBody, model) {
   }
 
   return new ReadableStream({
+    // IMPORTANTE: se un chunk contiene solo eventi che ignoriamo (es. il
+    // "response.created" iniziale, presente in ogni risposta reale), pull()
+    // non può limitarsi a tornare senza accodare nulla — Node NON lo
+    // richiama da solo in quel caso, e lo stream resterebbe bloccato in
+    // silenzio per sempre. Per questo qui dentro c'è un while: continua a
+    // leggere dall'upstream finché non ha davvero qualcosa da dare al
+    // client (o finisce/errore/completamento).
     async pull(controller) {
-      let done, value;
-      try {
-        ({ done, value } = await upstreamReader.read());
-      } catch (err) {
-        controller.error(err);
-        return;
-      }
-
-      if (done) {
-        controller.enqueue(chunk({}, 'stop'));
-        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-        controller.close();
-        return;
-      }
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop(); // ultima riga forse incompleta: rimessa in coda per il prossimo pull
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith('data:')) continue;
-        const raw = trimmed.slice(5).trim();
-        if (!raw || raw === '[DONE]') continue;
-
-        let event;
+      while (true) {
+        let done, value;
         try {
-          event = JSON.parse(raw);
-        } catch {
-          continue; // frammento non ancora completo o riga non-JSON: ignorata
+          ({ done, value } = await upstreamReader.read());
+        } catch (err) {
+          sendDiagnostics();
+          controller.error(err);
+          return;
         }
 
-        const type = event.type || '';
-        if (type.includes('output_text.delta') && typeof event.delta === 'string') {
-          controller.enqueue(chunk({ content: event.delta }));
-        } else if (type.includes('reasoning') && typeof event.delta === 'string') {
-          controller.enqueue(chunk({ reasoning_content: event.delta }));
-        } else if (type.includes('completed')) {
-          const usage = event.response && event.response.usage;
-          controller.enqueue(chunk({}, 'stop', usage));
+        if (done) {
+          sendDiagnostics();
+          controller.enqueue(chunk({}, 'stop'));
           controller.enqueue(encoder.encode('data: [DONE]\n\n'));
           controller.close();
           return;
-        } else if (type.includes('failed') || type === 'error') {
-          controller.error(new Error(event.message || 'Errore dalla Responses API'));
-          return;
         }
-        // altri tipi di evento (response.created, response.output_item.added,
-        // ...) non hanno un equivalente utile in Chat Completions: ignorati.
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // ultima riga forse incompleta: rimessa in coda per il prossimo giro
+
+        let enqueuedSomething = false;
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const raw = trimmed.slice(5).trim();
+          if (!raw || raw === '[DONE]') continue;
+
+          let event;
+          try {
+            event = JSON.parse(raw);
+          } catch {
+            continue; // frammento non ancora completo o riga non-JSON: ignorata
+          }
+
+          const type = event.type || '';
+          seenEventTypes.add(type);
+          if (type.includes('output_text.delta') && typeof event.delta === 'string') {
+            controller.enqueue(chunk({ content: event.delta }));
+            enqueuedSomething = true;
+          } else if (type.includes('reasoning') && typeof event.delta === 'string') {
+            reasoningSeen = true;
+            controller.enqueue(chunk({ reasoning_content: event.delta }));
+            enqueuedSomething = true;
+          } else if (type.includes('completed')) {
+            sendDiagnostics();
+            const usage = event.response && event.response.usage;
+            controller.enqueue(chunk({}, 'stop', usage));
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+            controller.close();
+            return;
+          } else if (type.includes('failed') || type === 'error') {
+            sendDiagnostics();
+            controller.error(new Error(event.message || 'Errore dalla Responses API'));
+            return;
+          }
+          // altri tipi di evento (response.created, response.output_item.added,
+          // ...) non hanno un equivalente utile in Chat Completions: ignorati,
+          // ma il loro "type" resta comunque in seenEventTypes per diagnostica.
+        }
+
+        if (enqueuedSomething) return; // il consumer ha ricevuto qualcosa: pull() può fermarsi qui
+        // altrimenti questo chunk conteneva solo eventi ignorati (es. il
+        // "response.created" iniziale): il while riparte e legge subito il
+        // pezzo successivo dall'upstream, invece di lasciare il consumer
+        // in attesa di un richiamo di pull() che non arriverebbe da solo.
       }
     },
     cancel(reason) {
+      sendDiagnostics();
       upstreamReader.cancel(reason).catch(() => {});
     },
   });
@@ -706,13 +791,20 @@ async function fetchBedrockResponses(chatBody, headers, region, timeoutMs) {
   if (!upstream.ok) return upstream;
 
   if (chatBody.stream) {
-    const stream = createChatCompletionsSSEStream(upstream.body, chatBody.model);
-    return new Response(stream, { status: upstream.status, headers: { 'content-type': 'text/event-stream' } });
+    const debugInfo = {};
+    const stream = createChatCompletionsSSEStream(upstream.body, chatBody.model, (info) => Object.assign(debugInfo, info));
+    const wrapped = new Response(stream, { status: upstream.status, headers: { 'content-type': 'text/event-stream' } });
+    // Oggetto popolato quando lo stream finisce di scorrere: l'handler lo
+    // legge DOPO aver consumato tutto lo stream, quindi lo trova già pieno.
+    wrapped._debugInfo = debugInfo;
+    return wrapped;
   }
 
   const responsesJson = await upstream.json();
-  const ccJson = toChatCompletionsResponse(responsesJson, chatBody.model);
-  return new Response(JSON.stringify(ccJson), { status: upstream.status, headers: { 'content-type': 'application/json' } });
+  const { ccJson, outputShape } = toChatCompletionsResponse(responsesJson, chatBody.model);
+  const wrapped = new Response(JSON.stringify(ccJson), { status: upstream.status, headers: { 'content-type': 'application/json' } });
+  if (outputShape) wrapped._debugInfo = { outputShape };
+  return wrapped;
 }
 
 // Punto unico di chiamata usato da callBedrockSmart: sceglie se passare da
@@ -914,6 +1006,12 @@ async function handler(req, res) {
         logEntry.reasoningDetected = reasoningDetected;
         if (reasoningPreview) logEntry.reasoningPreview = reasoningPreview;
         if (note) logEntry.note = note;
+        // Solo quando NON abbiamo rilevato reasoning: la forma degli eventi
+        // visti (mai il contenuto) aiuta a capire se il modello lo manda con
+        // un nome di evento diverso da quello che riconosciamo (vedi punto 14).
+        if (!reasoningDetected && attempt.response._debugInfo) {
+          logEntry.debugInfo = attempt.response._debugInfo;
+        }
         finalizeLogPromise = pushLog(logEntry);
         return finalizeLogPromise;
       };
@@ -955,6 +1053,9 @@ async function handler(req, res) {
     const reasoningText = getReasoningText(data?.choices?.[0]?.message);
     logEntry.reasoningDetected = Boolean(reasoningText && reasoningText.trim());
     if (reasoningText) logEntry.reasoningPreview = reasoningText.slice(0, REASONING_PREVIEW_CHARS);
+    if (!logEntry.reasoningDetected && attempt.response._debugInfo) {
+      logEntry.debugInfo = attempt.response._debugInfo;
+    }
     res.status(attempt.response.status).json(data); // risposta al client subito
     await pushLog(logEntry); // poi salva il log (anche su Redis se collegato)
     return;
